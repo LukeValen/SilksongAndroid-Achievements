@@ -326,6 +326,10 @@ Implementation sources: [launcher Kotlin code](src/SilksongLauncher.Launcher/app
 [native Steam shim](src/SilksongLauncher.Launcher/app/src/main/cpp/steam/steam_api_shim.c),
 and [game patches](tools/silksong-patches/src/).
 
+## Support the developer ☕🫐
+
+☕ The developer wanted to give you a good time, and in return you can offer them a coffee in https://ko-fi.com/lukevalen/donate 🫐
+
 ## Credits
 
 This project builds on **jakobkhansen and the SilksongAndroid contributors**.
