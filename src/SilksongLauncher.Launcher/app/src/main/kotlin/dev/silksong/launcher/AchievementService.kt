@@ -25,6 +25,7 @@ import `in`.dragonbra.javasteam.steam.handlers.steamuser.callback.PlayingSession
 import `in`.dragonbra.javasteam.steam.handlers.steamuserstats.Stats
 import `in`.dragonbra.javasteam.steam.handlers.steamuserstats.SteamUserStats
 import `in`.dragonbra.javasteam.steam.handlers.steamuserstats.callback.UserStatsCallback
+import `in`.dragonbra.javasteam.types.KeyValue
 import java.io.BufferedReader
 import java.io.Closeable
 import java.io.InputStreamReader
@@ -332,7 +333,7 @@ class AchievementService : Service() {
             LauncherLog.log("Achievements: Steam authorized user-stats access for app $APP_ID")
             rebuildAchievementIndex(snapshot)
             if (achievementLocations.isEmpty()) {
-                throw IllegalStateException("Steam returned no named Silksong achievements in the user-stats schema")
+                LauncherLog.log("Achievements: Steam schema mapping unavailable; allowing licensed game launch")
             }
 
             if (!running.get() || shuttingDown.get()) return
@@ -462,13 +463,98 @@ class AchievementService : Service() {
         AchievementDisplayStore.write(this, account, frame)
     }
 
+    /**
+     * Enumerate schema definitions even when Steam returns no user achievement
+     * blocks. The bits use KeyValue names ("0", "1", ...) for their indexes.
+     *
+     * We deliberately use a local view instead of constructing AchievementBlocks:
+     * shipped JavaSteam variants expose incompatible constructors (8 vs 10
+     * arguments). Constructing the wrong variant prevented the game from starting.
+     */
+    private data class SchemaAchievement(
+        val achievementId: Int,
+        val name: String?,
+        val displayName: String?,
+        val description: String?,
+        val icon: String?,
+        val iconGray: String?,
+        val hidden: Boolean,
+        val isUnlocked: Boolean,
+        val unlockTimestamp: Int,
+        val progressCurrent: Float?,
+        val progressMax: Float?,
+    )
+
+    private fun expandedSchemaAchievements(snapshot: UserStatsCallback): List<SchemaAchievement> {
+        val fallback = snapshot.getExpandedAchievements().map { item ->
+            SchemaAchievement(
+                achievementId = item.achievementId,
+                name = item.name,
+                displayName = item.displayName,
+                description = item.description,
+                icon = item.icon,
+                iconGray = item.iconGray,
+                hidden = item.hidden,
+                isUnlocked = item.isUnlocked,
+                unlockTimestamp = item.unlockTimestamp,
+                progressCurrent = item.progressCurrent,
+                progressMax = item.progressMax,
+            )
+        }
+        val statsSchema = snapshot.schemaKeyValues["stats"]
+        if (statsSchema == KeyValue.INVALID) return fallback
+
+        val userBlocks = snapshot.achievementBlocks.associateBy { it.achievementId }
+        val found = ArrayList<SchemaAchievement>()
+        for (stat in statsSchema.children) {
+            val statId = stat.name?.toIntOrNull() ?: continue
+            if (statId < 0 || statId > Int.MAX_VALUE / 100) continue
+            val bits = stat["bits"]
+            if (bits == KeyValue.INVALID) continue
+
+            for (bit in bits.children) {
+                val bitIndex = bit["bit"].value?.toIntOrNull()
+                    ?: bit.name?.toIntOrNull()
+                    ?: continue
+                if (bitIndex !in 0..31) continue
+                val name = bit["name"].value?.takeIf { it.isNotBlank() } ?: continue
+                val display = bit["display"]
+                val names = display["name"]
+                val descriptions = display["desc"]
+                val timestamp = userBlocks[statId]?.unlockTime?.getOrNull(bitIndex) ?: 0
+                found.add(
+                    SchemaAchievement(
+                        achievementId = statId * 100 + bitIndex,
+                        name = name,
+                        displayName = names["english"].value
+                            ?: names.children.firstOrNull()?.value,
+                        description = descriptions["english"].value
+                            ?: descriptions.children.firstOrNull()?.value,
+                        icon = display["icon"].value,
+                        iconGray = display["icon_gray"].value,
+                        hidden = display["hidden"].value == "1",
+                        isUnlocked = timestamp > 0,
+                        unlockTimestamp = timestamp,
+                        progressCurrent = null,
+                        progressMax = null,
+                    )
+                )
+            }
+        }
+        LauncherLog.log(
+            "Achievements: schema definitions=" + found.size +
+                ", Steam user blocks=" + snapshot.achievementBlocks.size
+        )
+        return found.ifEmpty { fallback }
+    }
+
     private fun rebuildAchievementIndex(snapshot: UserStatsCallback) {
         val newLocations = HashMap<String, AchievementLocation>()
         val newUnlocked = HashSet<String>()
         val display = ArrayList<DisplayAchievement>()
         val iconBase = "https://steamcdn-a.akamaihd.net/steamcommunity/public/images/apps/$APP_ID/"
 
-        for (achievement in snapshot.getExpandedAchievements()) {
+        for (achievement in expandedSchemaAchievements(snapshot)) {
             val apiName = achievement.name?.takeIf { it.isNotBlank() }
             val unlocked = achievement.isUnlocked
             val hidden = achievement.hidden
@@ -497,7 +583,7 @@ class AchievementService : Service() {
             val encoded = achievement.achievementId
             val bitIndex = encoded % 100
             val statId = encoded / 100
-            if (statId <= 0 || bitIndex !in 0..31) {
+            if (statId < 0 || bitIndex !in 0..31) {
                 LauncherLog.log("Achievements: ignoring invalid schema mapping $name -> stat=$statId bit=$bitIndex")
                 continue
             }
